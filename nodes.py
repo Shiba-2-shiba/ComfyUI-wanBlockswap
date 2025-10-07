@@ -28,6 +28,7 @@ class WanVideoBlockSwap:
                 "blocks_to_swap": ("INT", {"default": 20, "min": 0, "max": 40, "step": 1}),
                 "offload_img_emb": ("BOOLEAN", {"default": False}),
                 "offload_txt_emb": ("BOOLEAN", {"default": False}),
+                "offload_audio_proj": ("BOOLEAN", {"default": False}), # HuMoモデル対応のため追加
                 "use_non_blocking": ("BOOLEAN", {"default": False}),
             },
         }
@@ -35,27 +36,21 @@ class WanVideoBlockSwap:
     CATEGORY = "ComfyUI-wanBlockswap"
     FUNCTION = "set_callback"
 
-    def set_callback(self, model: ModelPatcher, blocks_to_swap, offload_txt_emb, offload_img_emb, use_non_blocking):
+    def set_callback(self, model: ModelPatcher, blocks_to_swap, offload_txt_emb, offload_img_emb, offload_audio_proj, use_non_blocking):
         
         instance_id = id(self)
         logging.info(f"WanVideoBlockSwap: Initializing for Patcher ID: {id(model)}")
 
-        # [SOLUTION] This callback runs AFTER the KSampler is done with the model.
-        # It fully unpatches the model (especially Lora) and cleans up VRAM.
         def cleanup_after_sampling(model_patcher: ModelPatcher):
             logging.info(f"-[ CLEANUP_AFTER_SAMPLING CALLBACK ({instance_id}) START | Patcher ID: {id(model_patcher)} ]-")
             
-            # Unpatch all weights (like LoRA) and restore the original model state.
             model_patcher.unpatch_model(model_patcher.offload_device, unpatch_weights=True)
             
-            # Force garbage collection and empty cache to defragment VRAM.
             comfy.model_management.soft_empty_cache()
             gc.collect()
             
             logging.info(f"-[ CLEANUP_AFTER_SAMPLING CALLBACK ({instance_id}) END ]-")
 
-        # This callback runs AFTER the model is loaded into VRAM.
-        # It moves the specified blocks to the offload device.
         def swap_blocks_after_load(model_patcher: ModelPatcher, device_to, lowvram_model_memory, force_patch_weights, full_load):
             logging.info(f"-[ SWAP_BLOCKS_AFTER_LOAD CALLBACK ({instance_id}) START | Patcher ID: {id(model_patcher)} ]-")
             
@@ -73,9 +68,17 @@ class WanVideoBlockSwap:
                 if offload_txt_emb:
                     logging.info(f"  - Offloading text_embedding to {offload_device}")
                     unet.text_embedding.to(offload_device, non_blocking=use_non_blocking)
-                if offload_img_emb:
+
+                if offload_img_emb and hasattr(unet, 'img_emb') and unet.img_emb is not None:
                     logging.info(f"  - Offloading img_emb to {offload_device}")
                     unet.img_emb.to(offload_device, non_blocking=use_non_blocking)
+
+                # >>> ADDED BLOCK FOR HUMO MODEL SUPPORT
+                if offload_audio_proj and hasattr(unet, 'audio_proj'):
+                    logging.info(f"  - Offloading audio_proj for HuMo model to {offload_device}")
+                    unet.audio_proj.to(offload_device, non_blocking=use_non_blocking)
+                # <<< END ADDED BLOCK
+
             else:
                 logging.warning(f"  - Model is not a WAN21 instance, block swapping skipped.")
 
@@ -85,10 +88,7 @@ class WanVideoBlockSwap:
         
         model = model.clone()
         
-        # Register the swapping callback to run AFTER loading
         model.add_callback_with_key(CallbacksMP.ON_LOAD, f"wan_block_swap_{instance_id}", swap_blocks_after_load)
-        
-        # Register the cleanup callback to run AFTER the model has been used for sampling
         model.add_callback_with_key(CallbacksMP.ON_CLEANUP, f"wan_cleanup_{instance_id}", cleanup_after_sampling)
 
         return (model, )
